@@ -16,43 +16,58 @@ from common.networks.component.scale import Scale
 from common.networks.component.rescale import upscale2x, downscale2x, blur
 
 class MappingNetwork(chainer.Chain):
-    def __init__(self, ch=512):
+    def __init__(self, ch=512, norm=False):
         super().__init__()
         self.ch = ch
+        self.norm = norm
         with self.init_scope():
             self.l = chainer.ChainList(
-                EqualizedLinear(ch, ch),
+                EqualizedLinear(ch, ch, lrmul=0.01),
                 LinkLeakyRelu(),
-                EqualizedLinear(ch, ch),
+                EqualizedLinear(ch, ch, lrmul=0.01),
                 LinkLeakyRelu(),
-                EqualizedLinear(ch, ch),
+                EqualizedLinear(ch, ch, lrmul=0.01),
                 LinkLeakyRelu(),
-                EqualizedLinear(ch, ch),
+                EqualizedLinear(ch, ch, lrmul=0.01),
                 LinkLeakyRelu(),
-                EqualizedLinear(ch, ch),
+                EqualizedLinear(ch, ch, lrmul=0.01),
                 LinkLeakyRelu(),
-                EqualizedLinear(ch, ch),
+                EqualizedLinear(ch, ch, lrmul=0.01),
                 LinkLeakyRelu(),
-                EqualizedLinear(ch, ch),
+                EqualizedLinear(ch, ch, lrmul=0.01),
                 LinkLeakyRelu(),
-                EqualizedLinear(ch, ch),
+                EqualizedLinear(ch, ch, lrmul=0.01),
                 LinkLeakyRelu(),
             )
             self.ln = len(self.l)
 
     def make_hidden(self, batch_size):
+
+        z = np.random.randn(batch_size, self.ch, 1, 1)
         xp = self.xp
         if xp != np:
-            z = xp.random.normal(size=(batch_size, self.ch, 1, 1), dtype='f')
-        else:
-            # no "dtype" in kwargs for numpy.random.normal
-            z = xp.random.normal(size=(batch_size, self.ch, 1, 1)).astype('f')
+            z = chainer.cuda.to_gpu(z)
+        
+        z = z.astype(np.float32)
+
         return z
+
+        # xp = self.xp
+        # if xp != np:
+        #     z = xp.random.normal(size=(batch_size, self.ch, 1, 1), dtype='f')
+        # else:
+        #     # no "dtype" in kwargs for numpy.random.normal
+        #     z = xp.random.normal(size=(batch_size, self.ch, 1, 1)).astype('f')
+        # return z
 
     def __call__(self, x):
         h = feature_vector_normalization(x)
+
         for i in range(self.ln):
             h = self.l[i](h)
+
+        if self.norm:
+            h = feature_vector_normalization(h)
         return h
 
 class NoiseBlock(chainer.Chain):
@@ -89,10 +104,25 @@ class StyleBlock(chainer.Chain):
             self.s = EqualizedLinear(w_in, ch, initial_bias=chainer.initializers.One(), gain=1)
             self.b = EqualizedLinear(w_in, ch, initial_bias=chainer.initializers.Zero(), gain=1)
     
+    def instance_norm(self, h, epsilon=1e-8):
+        mean = F.mean(h, axis = (2, 3), keepdims=True)
+        h = h - mean
+        sigma = F.rsqrt(F.mean(h**2, axis = (2, 3), keepdims=True) + epsilon)
+        h = h * sigma
+
+        return h
+
     def __call__(self, w, h):
         ws = self.s(w)
         wb = self.b(w)
-        return AdaIN(h, ws, wb)
+        target_shape = [h.shape[0], h.shape[1]] + [1] * (len(h.shape) - 2)
+        ws_cast = F.broadcast_to(F.reshape(ws, target_shape), h.shape)
+        wb_cast = F.broadcast_to(F.reshape(wb, target_shape), h.shape)
+
+        h = self.instance_norm(h)
+        return h * (ws_cast + 1) + wb_cast
+
+        #return AdaIN(h, ws, wb)
 
 
 class SynthesisBlock(chainer.Chain):
@@ -121,21 +151,27 @@ class SynthesisBlock(chainer.Chain):
         self.blur_k = None
         self.enable_blur = enable_blur
 
-    def __call__(self, w, x=None, add_noise=False):
+    def __call__(self, w, x=None, add_noise=True):
         h = x
         batch_size, _ = w.shape
+
         if self.upsample:
             assert h is not None
+            fused_scale = min(x.shape[2:]) * 2 >= 128
+
+            if not fused_scale:
+                h = upscale2x(h)
+                h = self.c0(h)
+            else:
+                h = self.c0(h, 'deconv')
+
             if self.blur_k is None:
                 k = np.asarray([1, 2, 1]).astype('f')
                 k = k[:, None] * k[None, :]
                 k = k / np.sum(k)
                 self.blur_k = self.xp.asarray(k)[None, None, :]
             if self.enable_blur:
-                h = blur(upscale2x(h), self.blur_k)
-            else:
-                h = upscale2x(h)
-            h = self.c0(h)
+                h = blur(h, self.blur_k)
         else:
             h = F.broadcast_to(self.W, (batch_size, self.ch_in, 4, 4))
         
@@ -153,7 +189,6 @@ class SynthesisBlock(chainer.Chain):
         h = F.leaky_relu(self.b1(h))
         h = self.s1(w, h)
         return h
-
 
 class StyleGenerator(chainer.Chain):
     def __init__(self, ch=512, enable_blur=False):
@@ -252,7 +287,7 @@ class Generator(chainer.Chain):
         self.ch = ch
         with self.init_scope():
             self.mapping = MappingNetwork()
-            self.gen = StyleGenerator(ch)
+            self.gen = StyleGenerator(ch, True)
 
     def make_hidden(self, batch_size):
         xp = self.xp
@@ -272,19 +307,35 @@ class Generator(chainer.Chain):
 class DiscriminatorBlockBase(chainer.Chain):
 
     def __init__(self, ch):
+        self.ch = ch
         super(DiscriminatorBlockBase, self).__init__()
         with self.init_scope():
-            self.c0 = EqualizedConv2d(ch, ch, 3, 1, 1)
-            self.c1 = EqualizedConv2d(ch, ch, 4, 1, 0)
+            self.c0 = EqualizedConv2d(ch + 1, ch, 3, 1, 1) # +1 means stddev layer feature
+            #self.c1 = EqualizedConv2d(ch, ch, 4, 1, 0)
+            self.l1 = EqualizedLinear(4*4*ch, ch)   # at this block,shape of input data is [ch, 4, 4]
             self.l2 = EqualizedLinear(ch, 1, gain=1)
 
+    def minibatch_stddev_alyer(self, xx, gsize=4, nfeature=1):
+        gsize = min(xx.shape[0], gsize)                 # Minibatch must be divisible by (or smaller than) group_size.
+        ss = xx.shape                                   # [NCHW]  Input shape.
+        hh = F.reshape(xx, (gsize, -1, nfeature, ss[1]//nfeature, ss[2], ss[3]))    # [GMncHW] Split minibatch into M groups of size G. Split channels into n channel groups c.
+        hh = hh - F.mean(hh, axis=0, keepdims=True)     # [GMncHW] Subtract mean over group.
+        hh = F.mean(F.square(hh), axis=0)               # [MncHW]  Calc variance over group.
+        hh = F.sqrt(hh + 1e-8)                          # [MncHW]  Calc stddev over group.
+        hh = F.mean(hh, axis=(2,3,4), keepdims=True)    # [Mn111]  Take average over fmaps and pixels.
+        hh = F.mean(hh, axis=2)                         # [Mn11] Split channels into c channel groups
+        hh = F.tile(hh, (gsize, 1, ss[2], ss[3]))       # [NnHW]  Replicate over group and pixels.
+        hh = F.concat((xx, hh))                         # [NCHW]  Append as new fmap.
+
+        return hh
+
     def __call__(self, x):
-        h = x
+        h = self.minibatch_stddev_alyer(x)
         h = F.leaky_relu((self.c0(h)))
-        h = F.leaky_relu((self.c1(h)))
+        h = F.reshape(h, (x.shape[0], 4*4*self.ch))
+        h = F.leaky_relu((self.l1(h)))
         h = self.l2(h)
         return h
-
 
 class DiscriminatorBlock(chainer.Chain):
 
@@ -293,24 +344,31 @@ class DiscriminatorBlock(chainer.Chain):
         self.in_ch = in_ch
         self.out_ch = out_ch
         with self.init_scope():
-            self.c0 = EqualizedConv2d(in_ch, out_ch, 3, 1, 1)
-            self.c1 = EqualizedConv2d(out_ch, out_ch, 3, 1, 1)
+            self.c0 = EqualizedConv2d(in_ch, in_ch, 3, 1, 1)
+            self.c1 = EqualizedConv2d(in_ch, out_ch, 3, 1, 1)
         self.blur_k = None
         self.enable_blur = enable_blur
 
     def __call__(self, x):
         h = x
         h = F.leaky_relu((self.c0(h)))
-        h = F.leaky_relu((self.c1(h)))
+
         if self.blur_k is None:
             k = np.asarray([1, 2, 1]).astype('f')
             k = k[:, None] * k[None, :]
             k = k / np.sum(k)
             self.blur_k = self.xp.asarray(k)[None, None, :]
         if self.enable_blur:
-            h = blur(downscale2x(h), self.blur_k)
+            h = blur(h, self.blur_k)
+        
+        fused_scale = min(x.shape[2:]) * 2 >= 128
+
+        if not fused_scale:
+            h = self.c1(h)
+            h = F.leaky_relu(downscale2x(h))
         else:
-            h = downscale2x(h)
+            h = F.leaky_relu(self.c1(h, 'conv'))
+        
         return h
 
 
@@ -362,6 +420,7 @@ class Discriminator(chainer.Chain):
             k = (stage - 2) // 2
             h = F.leaky_relu(self.ins[k + 1](h))
             for i in reversed(range(0, (k + 1) + 1)):  # k+1 .. 0
+                print(i, h.shape)
                 h = self.blocks[i](h)
         else:
             k = (stage - 1) // 2

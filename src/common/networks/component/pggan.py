@@ -20,9 +20,34 @@ class EqualizedConv2d(chainer.Chain):
         with self.init_scope():
             self.c = L.Convolution2D(in_ch, out_ch, ksize, stride, pad, initialW=w, nobias=nobias)
 
-    def __call__(self, x):
-        return self.c(self.inv_c * x)
+    def deconv(self, x):
+        wdec = self.c.W
+        wdec = F.transpose(wdec, (1, 0, 2, 3)) #[ch_in, ch_out, kh, kw]
+        wdec = F.pad(wdec, [[0,0], [0,0], [1,1], [1,1]], 'constant', constant_values=0)        
+        wdec = wdec[:, :, 1:, 1:] + wdec[:, :, :-1, 1:] + wdec[:, :, 1:, :-1] + wdec[:, :, :-1, :-1]
 
+        out_shape = [x.shape[2]*2, x.shape[3]*2]
+
+        return F.deconvolution_2d(x, wdec, b = self.c.b, pad = self.c.pad, stride = 2, outsize=out_shape)
+
+    def conv(self, x):
+        wdec = self.c.W
+        wdec = F.pad(wdec, [[0,0], [0,0], [1,1], [1,1]], 'constant', constant_values=0)        
+        wdec = wdec[:, :, 1:, 1:] + wdec[:, :, :-1, 1:] + wdec[:, :, 1:, :-1] + wdec[:, :, :-1, :-1]
+        wdec = 0.25 * wdec
+
+        return F.convolution_2d(x, wdec, b = self.c.b, pad = self.c.pad, stride = 2)
+
+    def __call__(self, x, mode = 'asis'):
+
+        assert mode in ['asis', 'conv', 'deconv']
+
+        if mode == 'asis':
+            return self.c(self.inv_c * x)
+        elif mode == 'conv':
+            return self.conv(self.inv_c * x)
+        elif mode == 'deconv':
+            return self.deconv(self.inv_c * x)
 
 class EqualizedDeconv2d(chainer.Chain):
 
@@ -43,6 +68,7 @@ class EqualizedLinear(chainer.Chain):
         w = chainer.initializers.Normal(1.0/lrmul) # equalized learning rate
         self.inv_c = gain * np.sqrt(1.0 / in_ch)
         self.inv_c = self.inv_c * lrmul
+        self.lrmul = lrmul
         super(EqualizedLinear, self).__init__()
         with self.init_scope():
             self.c = L.Linear(in_ch, out_ch, initialW=w, initial_bias=initial_bias, nobias=nobias)
