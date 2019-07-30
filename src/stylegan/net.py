@@ -52,14 +52,6 @@ class MappingNetwork(chainer.Chain):
 
         return z
 
-        # xp = self.xp
-        # if xp != np:
-        #     z = xp.random.normal(size=(batch_size, self.ch, 1, 1), dtype='f')
-        # else:
-        #     # no "dtype" in kwargs for numpy.random.normal
-        #     z = xp.random.normal(size=(batch_size, self.ch, 1, 1)).astype('f')
-        # return z
-
     def __call__(self, x):
         h = feature_vector_normalization(x)
 
@@ -94,7 +86,6 @@ class NoiseBlock(chainer.Chain):
         h = h + self.b(noise)
         return h
 
-
 class StyleBlock(chainer.Chain):
     def __init__(self, w_in, ch):
         super().__init__()
@@ -112,18 +103,24 @@ class StyleBlock(chainer.Chain):
 
         return h
 
-    def __call__(self, w, h):
-        ws = self.s(w)
-        wb = self.b(w)
+    def apply_style(self, ws, wb, h):
         target_shape = [h.shape[0], h.shape[1]] + [1] * (len(h.shape) - 2)
         ws_cast = F.broadcast_to(F.reshape(ws, target_shape), h.shape)
         wb_cast = F.broadcast_to(F.reshape(wb, target_shape), h.shape)
-
         h = self.instance_norm(h)
         return h * (ws_cast + 1) + wb_cast
 
-        #return AdaIN(h, ws, wb)
+    def get_style(self, w):
+        ws = self.s(w)
+        wb = self.b(w)
 
+        return ws, wb
+
+    def __call__(self, w, h):
+
+        ws, wb = self.get_style(w)
+
+        return self.apply_style(ws, wb, h)
 
 class SynthesisBlock(chainer.Chain):
     def __init__(self, ch=512, ch_in=512, w_ch= 512, upsample=True, enable_blur=False):
@@ -151,27 +148,62 @@ class SynthesisBlock(chainer.Chain):
         self.blur_k = None
         self.enable_blur = enable_blur
 
-    def __call__(self, w, x=None, add_noise=True):
-        h = x
+    def _upsample(self, h):
+        fused_scale = min(h.shape[2:]) * 2 >= 128
+
+        if not fused_scale:
+            h = upscale2x(h)
+            h = self.c0(h)
+        else:
+            h = self.c0(h, 'deconv')
+
+        if self.blur_k is None:
+            k = np.asarray([1, 2, 1]).astype('f')
+            k = k[:, None] * k[None, :]
+            k = k / np.sum(k)
+            self.blur_k = self.xp.asarray(k)[None, None, :]
+        if self.enable_blur:
+            h = blur(h, self.blur_k)
+
+        return h
+
+    def apply_style(self, ws0, wb0, ws1, wb1, x=None, add_noise=True):
+        batch_size, _ = ws0.shape
+
+        if self.upsample:
+            assert x is not None
+            h = self._upsample(x)
+        else:
+            h = F.broadcast_to(self.W, (batch_size, self.ch_in, 4, 4))
+        
+        # h should be (batch, ch, size, size)
+        if add_noise:
+            h = self.n0(h)
+
+        h = F.leaky_relu(self.b0(h))
+        h = self.s0.apply_style(ws0, wb0, h)
+
+        h = self.c1(h)
+        if add_noise:
+            h = self.n1(h)
+
+        h = F.leaky_relu(self.b1(h))
+        h = self.s1.apply_style(ws1, wb1, h)
+
+        return h
+
+    def get_style(self, w):
+        ws0, wb0 = self.s0.get_style(w)
+        ws1, wb1 = self.s1.get_style(w)
+
+        return ws0, wb0, ws1, wb1
+
+    def __call__(self, w, x=None, add_noise=True, w2=None):
         batch_size, _ = w.shape
 
         if self.upsample:
-            assert h is not None
-            fused_scale = min(x.shape[2:]) * 2 >= 128
-
-            if not fused_scale:
-                h = upscale2x(h)
-                h = self.c0(h)
-            else:
-                h = self.c0(h, 'deconv')
-
-            if self.blur_k is None:
-                k = np.asarray([1, 2, 1]).astype('f')
-                k = k[:, None] * k[None, :]
-                k = k / np.sum(k)
-                self.blur_k = self.xp.asarray(k)[None, None, :]
-            if self.enable_blur:
-                h = blur(h, self.blur_k)
+            assert x is not None
+            h = self._upsample(x)
         else:
             h = F.broadcast_to(self.W, (batch_size, self.ch_in, 4, 4))
         
@@ -187,7 +219,11 @@ class SynthesisBlock(chainer.Chain):
             h = self.n1(h)
 
         h = F.leaky_relu(self.b1(h))
-        h = self.s1(w, h)
+        if w2 is None:
+            h = self.s1(w, h)
+        else:
+            h = self.s1(w2, h)
+
         return h
 
 class StyleGenerator(chainer.Chain):
@@ -222,7 +258,72 @@ class StyleGenerator(chainer.Chain):
         self.image_size = 1024
         self.enable_blur = enable_blur
 
-    def __call__(self, w, stage, add_noise=True, w2=None):
+    def get_styles(self, w, stage):
+        k = (stage-2)//2+2 if stage%2 == 0 else (stage-1)//2+1
+        dst = []
+
+        for ii in range(k):
+            dst.append(self.blocks[ii].get_style(w))
+
+        return dst
+
+    def generate_with_latents(self, w, stage, add_noise=True, w2=None):
+        '''
+            for alpha in [0, 1), and 2*k+2 + alpha < self.max_stage (-1 <= k <= ...):
+            stage 0 + alpha       : z ->        block[0] -> out[0] * 1
+            stage 2*k+1 + alpha   : z -> ... -> block[k] -> (up -> out[k]) * (1 - alpha)
+                                    .................... -> (block[k+1] -> out[k+1]) * (alpha)
+            stage 2*k+2 + alpha   : z -> ............... -> (block[k+1] -> out[k+1]) * 1
+            over flow stages continues.
+        '''
+
+        stage = min(stage, self.max_stage - 1e-8)
+        alpha = stage - math.floor(stage)
+        stage = math.floor(stage)
+
+        h = None
+        if stage % 2 == 0:
+            k = (stage - 2) // 2
+            
+            for i in range(0, (k + 1) + 1):  # 0 .. k+1
+
+                if w2 is not None and w2[i] is not None:
+                    _w = w2[i]
+                else:
+                    _w = w[i]
+
+                h = self.blocks[i](_w[0], h, add_noise, _w[1])
+
+            h = self.outs[k + 1](h)
+
+        else:
+            k = (stage - 1) // 2
+
+            for i in range(0, k + 1):  # 0 .. k
+
+                if w2 is not None and w2[i] is not None:
+                    _w = w2[i]
+                else:
+                    _w = w[i]
+
+                h = self.blocks[i](_w[0], h, add_noise, _w[1])
+
+            h_0 = self.outs[k](upscale2x(h))
+            h_1 = self.outs[k + 1](self.blocks[k + 1](w, x=h, add_noise=add_noise))
+            assert 0. <= alpha < 1.
+            h = (1.0 - alpha) * h_0 + alpha * h_1
+
+        if chainer.configuration.config.train:
+            return h
+        else:
+            min_sample_image_size = 64
+            if h.data.shape[2] < min_sample_image_size:  # too small
+                scale = int(min_sample_image_size // h.data.shape[2])
+                return F.unpooling_2d(h, scale, scale, 0, outsize=(min_sample_image_size, min_sample_image_size))
+            else:
+                return h
+
+    def __call__(self, w, stage, add_noise=True, w2=None, _lim = None):
         '''
             for alpha in [0, 1), and 2*k+2 + alpha < self.max_stage (-1 <= k <= ...):
             stage 0 + alpha       : z ->        block[0] -> out[0] * 1
@@ -242,7 +343,10 @@ class StyleGenerator(chainer.Chain):
             
             # Enable Style Mixing:
             if w2 is not None and k >= 0:
-                lim = np.random.randint(1, k+2)
+                if _lim is None:
+                    lim = np.random.randint(1, k+2)
+                else:
+                    lim = _lim
             else:
                 lim = k+2
 
@@ -257,7 +361,10 @@ class StyleGenerator(chainer.Chain):
             k = (stage - 1) // 2
 
             if w2 is not None and k >= 1:
-                lim = np.random.randint(1, k+1)
+                if _lim is None:
+                    lim = np.random.randint(1, k+1)
+                else:
+                    lim = _lim
             else:
                 lim = k+1
 
@@ -315,7 +422,7 @@ class DiscriminatorBlockBase(chainer.Chain):
             self.l1 = EqualizedLinear(4*4*ch, ch)   # at this block,shape of input data is [ch, 4, 4]
             self.l2 = EqualizedLinear(ch, 1, gain=1)
 
-    def minibatch_stddev_alyer(self, xx, gsize=4, nfeature=1):
+    def minibatch_stddev_layer(self, xx, gsize=4, nfeature=1):
         gsize = min(xx.shape[0], gsize)                 # Minibatch must be divisible by (or smaller than) group_size.
         ss = xx.shape                                   # [NCHW]  Input shape.
         hh = F.reshape(xx, (gsize, -1, nfeature, ss[1]//nfeature, ss[2], ss[3]))    # [GMncHW] Split minibatch into M groups of size G. Split channels into n channel groups c.
@@ -330,7 +437,7 @@ class DiscriminatorBlockBase(chainer.Chain):
         return hh
 
     def __call__(self, x):
-        h = self.minibatch_stddev_alyer(x)
+        h = self.minibatch_stddev_layer(x)
         h = F.leaky_relu((self.c0(h)))
         h = F.reshape(h, (x.shape[0], 4*4*self.ch))
         h = F.leaky_relu((self.l1(h)))
@@ -402,7 +509,7 @@ class Discriminator(chainer.Chain):
                 EqualizedConv2d(3, ch // 32, 1, 1, 0),)
             self.enable_blur = enable_blur
             
-    def __call__(self, x, stage):
+    def _hs(self, x, stage):
         '''
             for alpha in [0, 1), and 2*k+2 + alpha < self.max_stage (-1 <= k <= ...):
             stage 0 + alpha       : p <-        block[0] <- in[0] * 1
@@ -411,17 +518,19 @@ class Discriminator(chainer.Chain):
             stage 2*k+2 + alpha   : p <- ............... <- (block[k+1] <- in[k+1]) * 1
             over flow stages continues.
         '''
+
         stage = min(stage, self.max_stage - 1e-8)
         alpha = stage - math.floor(stage)
         stage = math.floor(stage)
 
         h = x
+        hs = []
         if stage % 2 == 0:
             k = (stage - 2) // 2
             h = F.leaky_relu(self.ins[k + 1](h))
             for i in reversed(range(0, (k + 1) + 1)):  # k+1 .. 0
-                print(i, h.shape)
                 h = self.blocks[i](h)
+                hs.append(h)
         else:
             k = (stage - 1) // 2
 
@@ -432,5 +541,9 @@ class Discriminator(chainer.Chain):
 
             for i in reversed(range(0, k + 1)):  # k .. 0
                 h = self.blocks[i](h)
+                hs.append(h)
 
-        return h
+        return hs
+
+    def __call__(self, x, stage):
+        return self._hs(x, stage)[-1]
